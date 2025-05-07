@@ -2,85 +2,114 @@
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
-using System.Text;
+using System.Threading.Tasks;
 
-class AES
+class AESECBParallel
 {
-    public static byte[] EncryptData(byte[] data, byte[] key, byte[] iv)
+    // Encrypt a single block using ECB mode
+    public static byte[] EncryptBlock(byte[] block, byte[] key)
     {
         using (var aes = Aes.Create())
         {
             aes.Key = key;
-            aes.IV = iv;
-            aes.Mode = CipherMode.CBC;
+            aes.Mode = CipherMode.ECB;  // Independent blocks
             aes.Padding = PaddingMode.PKCS7;
-
-            using (var encryptor = aes.CreateEncryptor(aes.Key, aes.IV))
-            using (var ms = new MemoryStream())
-            using (var cs = new CryptoStream(ms, encryptor, CryptoStreamMode.Write))
+            using (var encryptor = aes.CreateEncryptor())
             {
-                cs.Write(data, 0, data.Length);
-                cs.FlushFinalBlock();
-                return ms.ToArray();
+                return encryptor.TransformFinalBlock(block, 0, block.Length);
             }
         }
     }
 
-    public static byte[] DecryptData(byte[] data, byte[] key, byte[] iv)
+    // Decrypt a single block using ECB mode
+    public static byte[] DecryptBlock(byte[] block, byte[] key)
     {
         using (var aes = Aes.Create())
         {
             aes.Key = key;
-            aes.IV = iv;
-            aes.Mode = CipherMode.CBC;
+            aes.Mode = CipherMode.ECB;
             aes.Padding = PaddingMode.PKCS7;
-
-            using (var decryptor = aes.CreateDecryptor(aes.Key, aes.IV))
-            using (var ms = new MemoryStream(data))
-            using (var cs = new CryptoStream(ms, decryptor, CryptoStreamMode.Read))
-            using (var reader = new MemoryStream())
+            using (var decryptor = aes.CreateDecryptor())
             {
-                cs.CopyTo(reader);
-                return reader.ToArray();
+                return decryptor.TransformFinalBlock(block, 0, block.Length);
             }
         }
     }
 
     static void Main()
     {
-        string inputFile = "final.txt";
+        string inputFile = "Al_Saselea_Input.txt";
         string encryptedFile = "encrypted.txt";
         string decryptedFile = "decrypted.txt";
-        int iterations = 9000; 
-
+        int iterations = 9000;
         byte[] data = File.ReadAllBytes(inputFile);
 
+        byte[] key;
         using (var aes = Aes.Create())
         {
             aes.GenerateKey();
-            aes.GenerateIV();
-
-            Console.WriteLine("=== Sequential Mode ===");
-            Stopwatch encryptionTimer = Stopwatch.StartNew();
-
-            byte[] encryptedData = data;
-            for (int i = 0; i < iterations; i++)
-            {
-                encryptedData = EncryptData(encryptedData, aes.Key, aes.IV);
-            }
-            encryptionTimer.Stop();
-            File.WriteAllBytes(encryptedFile, encryptedData);
-            Console.WriteLine($"[Sequential] Total Encryption time: {encryptionTimer.Elapsed}");
-
-            Stopwatch decryptionTimer = Stopwatch.StartNew();
-            byte[] decryptedData = encryptedData;
-            for (int i = 0; i < iterations; i++)
-            {
-                decryptedData = DecryptData(decryptedData, aes.Key, aes.IV);
-            }
-            decryptionTimer.Stop();
-            File.WriteAllBytes(decryptedFile, decryptedData);
-            Console.WriteLine($"[Sequential] Total Decryption time: {decryptionTimer.Elapsed}");
+            key = aes.Key;
         }
+
+        int blockSize = 16384;
+        int blockCount = (data.Length + blockSize - 1) / blockSize;
+        byte[][] blocks = new byte[blockCount][];
+        for (int i = 0; i < blockCount; i++)
+        {
+            int currentBlockSize = Math.Min(blockSize, data.Length - i * blockSize);
+            blocks[i] = new byte[currentBlockSize];
+            Array.Copy(data, i * blockSize, blocks[i], 0, currentBlockSize);
+        }
+
+        Console.WriteLine("=== Parallel ECB Mode ===");
+        Stopwatch encryptionTimer = Stopwatch.StartNew();
+        // Parallel encryption: process each block independently
+        Parallel.For(0, blockCount, i =>
+        {
+            byte[] block = blocks[i];
+            // Perform the iterative encryption on each block
+            for (int j = 0; j < iterations; j++)
+            {
+                block = EncryptBlock(block, key);
+            }
+            blocks[i] = block;
+        });
+        encryptionTimer.Stop();
+
+        // Combine encrypted blocks back into a single byte array
+        using (var ms = new MemoryStream())
+        {
+            foreach (var block in blocks)
+            {
+                ms.Write(block, 0, block.Length);
+            }
+            File.WriteAllBytes(encryptedFile, ms.ToArray());
+        }
+        Console.WriteLine($"[Parallel] Total Encryption time: {encryptionTimer.Elapsed}");
+
+        // Now for decryption (using the reverse process)
+        Stopwatch decryptionTimer = Stopwatch.StartNew();
+        Parallel.For(0, blockCount, i =>
+        {
+            byte[] block = blocks[i];
+            // Reverse the iterations for decryption
+            for (int j = 0; j < iterations; j++)
+            {
+                block = DecryptBlock(block, key);
+            }
+            blocks[i] = block;
+        });
+        decryptionTimer.Stop();
+
+        // Combine decrypted blocks and write to file
+        using (var ms = new MemoryStream())
+        {
+            foreach (var block in blocks)
+            {
+                ms.Write(block, 0, block.Length);
+            }
+            File.WriteAllBytes(decryptedFile, ms.ToArray());
+        }
+        Console.WriteLine($"[Parallel] Total Decryption time: {decryptionTimer.Elapsed}");
     }
 }
