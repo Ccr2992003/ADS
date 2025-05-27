@@ -1,18 +1,18 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 class AESECBParallel
 {
-    // Encrypt a single block using ECB mode
     public static byte[] EncryptBlock(byte[] block, byte[] key)
     {
         using (var aes = Aes.Create())
         {
             aes.Key = key;
-            aes.Mode = CipherMode.ECB;  // Independent blocks
+            aes.Mode = CipherMode.ECB;
             aes.Padding = PaddingMode.PKCS7;
             using (var encryptor = aes.CreateEncryptor())
             {
@@ -21,7 +21,6 @@ class AESECBParallel
         }
     }
 
-    // Decrypt a single block using ECB mode
     public static byte[] DecryptBlock(byte[] block, byte[] key)
     {
         using (var aes = Aes.Create())
@@ -61,22 +60,12 @@ class AESECBParallel
             Array.Copy(data, i * blockSize, blocks[i], 0, currentBlockSize);
         }
 
-        Console.WriteLine("=== Parallel ECB Mode ===");
-        Stopwatch encryptionTimer = Stopwatch.StartNew();
-        // Parallel encryption: process each block independently
-        Parallel.For(0, blockCount, i =>
-        {
-            byte[] block = blocks[i];
-            // Perform the iterative encryption on each block
-            for (int j = 0; j < iterations; j++)
-            {
-                block = EncryptBlock(block, key);
-            }
-            blocks[i] = block;
-        });
+        Console.WriteLine("=== Channel-Based ECB Mode ===");
+
+        var encryptionTimer = Stopwatch.StartNew();
+        ProcessWithChannels(blocks, key, iterations, true).Wait();
         encryptionTimer.Stop();
 
-        // Combine encrypted blocks back into a single byte array
         using (var ms = new MemoryStream())
         {
             foreach (var block in blocks)
@@ -85,23 +74,12 @@ class AESECBParallel
             }
             File.WriteAllBytes(encryptedFile, ms.ToArray());
         }
-        Console.WriteLine($"[Parallel] Total Encryption time: {encryptionTimer.Elapsed}");
+        Console.WriteLine($" Total Encryption time: {encryptionTimer.Elapsed}");
 
-        // Now for decryption (using the reverse process)
-        Stopwatch decryptionTimer = Stopwatch.StartNew();
-        Parallel.For(0, blockCount, i =>
-        {
-            byte[] block = blocks[i];
-            // Reverse the iterations for decryption
-            for (int j = 0; j < iterations; j++)
-            {
-                block = DecryptBlock(block, key);
-            }
-            blocks[i] = block;
-        });
+        var decryptionTimer = Stopwatch.StartNew();
+        ProcessWithChannels(blocks, key, iterations, false).Wait();
         decryptionTimer.Stop();
 
-        // Combine decrypted blocks and write to file
         using (var ms = new MemoryStream())
         {
             foreach (var block in blocks)
@@ -110,6 +88,48 @@ class AESECBParallel
             }
             File.WriteAllBytes(decryptedFile, ms.ToArray());
         }
-        Console.WriteLine($"[Parallel] Total Decryption time: {decryptionTimer.Elapsed}");
+        Console.WriteLine($" Total Decryption time: {decryptionTimer.Elapsed}");
+    }
+
+    static async Task ProcessWithChannels(byte[][] blocks, byte[] key, int iterations, bool encrypt)
+    {
+        var channel = Channel.CreateBounded<(int index, byte[] block)>(new BoundedChannelOptions(512)
+        {
+            SingleWriter = true,
+            SingleReader = false,
+            FullMode = BoundedChannelFullMode.Wait
+        });
+
+        int processorCount = Environment.ProcessorCount;
+        Task[] workers = new Task[processorCount];
+
+        for (int w = 0; w < processorCount; w++)
+        {
+            workers[w] = Task.Run(async () =>
+            {
+                var reader = channel.Reader;
+                while (await reader.WaitToReadAsync())
+                {
+                    while (reader.TryRead(out var item))
+                    {
+                        byte[] result = item.block;
+                        for (int i = 0; i < iterations; i++)
+                        {
+                            result = encrypt ? EncryptBlock(result, key) : DecryptBlock(result, key);
+                        }
+                        blocks[item.index] = result;
+                    }
+                }
+            });
+        }
+
+        var writer = channel.Writer;
+        for (int i = 0; i < blocks.Length; i++)
+        {
+            await writer.WriteAsync((i, blocks[i]));
+        }
+
+        writer.Complete();
+        await Task.WhenAll(workers);
     }
 }
